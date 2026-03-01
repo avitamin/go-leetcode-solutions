@@ -104,6 +104,12 @@ make migrate-create NAME=add_users_table
 Direct command examples:
 
 ```bash
-go run ./cmd/migrate up
+go run ./cmd/migrate --dsn "postgres://leetcode:leetcode@localhost:5433/leetcode?sslmode=disable" up
 go run ./cmd/migrate create --name add_indexes
+```
+
+Run migration integration tests (requires PostgreSQL running):
+
+```bash
+make test-migrate-integration
 ```

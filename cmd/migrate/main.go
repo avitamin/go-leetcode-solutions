@@ -1,43 +1,36 @@
 package main
 
 import (
-	"bytes"
 	"errors"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/golang-migrate/migrate/v4"
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	_ "github.com/golang-migrate/migrate/v4/source/file"
 )
 
-const migrationTable = "schema_migrations"
-
 type config struct {
-	composeCmd string
-	service    string
-	user       string
-	dbName     string
-	dir        string
+	dsn string
+	dir string
 }
 
 type migration struct {
-	version  string
-	name     string
-	upPath   string
-	downPath string
+	version uint64
+	name    string
 }
 
 func main() {
 	cfg := config{}
 	fs := flag.NewFlagSet("migrate", flag.ExitOnError)
-	fs.StringVar(&cfg.composeCmd, "compose-cmd", "docker compose", "Compose command to use")
-	fs.StringVar(&cfg.service, "service", "postgres", "Compose service name")
-	fs.StringVar(&cfg.user, "user", "leetcode", "PostgreSQL user")
-	fs.StringVar(&cfg.dbName, "db", "leetcode", "PostgreSQL database name")
+	fs.StringVar(&cfg.dsn, "dsn", "postgres://leetcode:leetcode@localhost:5433/leetcode?sslmode=disable", "PostgreSQL DSN")
 	fs.StringVar(&cfg.dir, "dir", "migrations", "Migrations directory")
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [flags] <command>\n\n", filepath.Base(os.Args[0]))
@@ -82,79 +75,49 @@ func main() {
 }
 
 func migrateUp(cfg config) error {
-	migrations, err := collectMigrations(cfg.dir)
+	m, err := newMigrator(cfg)
 	if err != nil {
 		return err
 	}
-	if len(migrations) == 0 {
-		fmt.Println("No migrations found")
-		return nil
-	}
+	defer closeMigrator(m)
 
-	if err := ensureMigrationTable(cfg); err != nil {
-		return err
-	}
-
-	applied, err := getAppliedSet(cfg)
-	if err != nil {
-		return err
-	}
-
-	appliedCount := 0
-	for _, m := range migrations {
-		if applied[m.version] {
-			continue
+	if err := m.Up(); err != nil {
+		if errors.Is(err, migrate.ErrNoChange) {
+			fmt.Println("No pending migrations")
+			return nil
 		}
-		if m.upPath == "" {
-			return fmt.Errorf("missing up migration for version %s", m.version)
-		}
-		if err := applyUpMigration(m, cfg); err != nil {
-			return err
-		}
-		appliedCount++
+		return fmt.Errorf("migrate up: %w", err)
 	}
 
-	fmt.Printf("Applied %d migration(s)\n", appliedCount)
+	fmt.Println("Migrations applied")
 	return nil
 }
 
 func migrateDown(cfg config) error {
-	if err := ensureMigrationTable(cfg); err != nil {
-		return err
-	}
-
-	lastVersion, err := getLastAppliedVersion(cfg)
+	m, err := newMigrator(cfg)
 	if err != nil {
 		return err
 	}
-	if lastVersion == "" {
-		fmt.Println("No applied migrations")
-		return nil
-	}
+	defer closeMigrator(m)
 
-	migrations, err := collectMigrations(cfg.dir)
+	_, _, err = m.Version()
 	if err != nil {
-		return err
+		if errors.Is(err, migrate.ErrNilVersion) {
+			fmt.Println("No applied migrations")
+			return nil
+		}
+		return fmt.Errorf("read current migration version: %w", err)
 	}
 
-	byVersion := make(map[string]migration, len(migrations))
-	for _, m := range migrations {
-		byVersion[m.version] = m
+	if err := m.Steps(-1); err != nil {
+		if errors.Is(err, migrate.ErrNoChange) || errors.Is(err, migrate.ErrNilVersion) {
+			fmt.Println("No applied migrations")
+			return nil
+		}
+		return fmt.Errorf("migrate down: %w", err)
 	}
 
-	m, ok := byVersion[lastVersion]
-	if !ok {
-		return fmt.Errorf("applied migration %s not found in %q", lastVersion, cfg.dir)
-	}
-	if m.downPath == "" {
-		return fmt.Errorf("missing down migration for version %s", m.version)
-	}
-
-	if err := applyDownMigration(m, cfg); err != nil {
-		return err
-	}
-
-	fmt.Printf("Rolled back %s_%s\n", m.version, m.name)
+	fmt.Println("Rolled back last migration")
 	return nil
 }
 
@@ -163,27 +126,46 @@ func migrateStatus(cfg config) error {
 	if err != nil {
 		return err
 	}
-
-	if err := ensureMigrationTable(cfg); err != nil {
-		return err
-	}
-
-	applied, err := getAppliedSet(cfg)
-	if err != nil {
-		return err
-	}
-
 	if len(migrations) == 0 {
 		fmt.Println("No migrations found")
 		return nil
 	}
 
-	for _, m := range migrations {
+	m, err := newMigrator(cfg)
+	if err != nil {
+		return err
+	}
+	defer closeMigrator(m)
+
+	current, dirty, err := m.Version()
+	var currentVersion uint64
+	hasCurrent := false
+	if err != nil {
+		if !errors.Is(err, migrate.ErrNilVersion) {
+			return fmt.Errorf("read migration status: %w", err)
+		}
+		fmt.Println("Current version: none")
+	} else {
+		currentVersion = uint64(current)
+		hasCurrent = true
+		fmt.Printf("Current version: %d", current)
+		if dirty {
+			fmt.Print(" (dirty)")
+		}
+		fmt.Println()
+	}
+
+	for _, mig := range migrations {
 		state := "pending"
-		if applied[m.version] {
+		switch {
+		case hasCurrent && mig.version < currentVersion:
+			state = "applied"
+		case hasCurrent && mig.version == currentVersion && dirty:
+			state = "dirty"
+		case hasCurrent && mig.version == currentVersion:
 			state = "applied"
 		}
-		fmt.Printf("%s_%s %s\n", m.version, m.name, state)
+		fmt.Printf("%d_%s %s\n", mig.version, mig.name, state)
 	}
 
 	return nil
@@ -261,13 +243,13 @@ func collectMigrations(dir string) ([]migration, error) {
 	}
 
 	type partial struct {
-		version  string
-		name     string
-		upPath   string
-		downPath string
+		version uint64
+		name    string
+		hasUp   bool
+		hasDown bool
 	}
 
-	partials := map[string]partial{}
+	partials := map[uint64]partial{}
 
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -275,197 +257,104 @@ func collectMigrations(dir string) ([]migration, error) {
 		}
 
 		name := entry.Name()
-		path := filepath.Join(dir, name)
-
+		var base string
+		var isUp, isDown bool
 		switch {
 		case strings.HasSuffix(name, ".up.sql"):
-			base := strings.TrimSuffix(name, ".up.sql")
-			version, migName, err := parseMigrationBase(base)
-			if err != nil {
-				return nil, err
-			}
-			p := partials[version]
-			if p.version == "" {
-				p.version = version
-				p.name = migName
-			}
-			p.upPath = path
-			partials[version] = p
+			base = strings.TrimSuffix(name, ".up.sql")
+			isUp = true
 		case strings.HasSuffix(name, ".down.sql"):
-			base := strings.TrimSuffix(name, ".down.sql")
-			version, migName, err := parseMigrationBase(base)
-			if err != nil {
-				return nil, err
-			}
-			p := partials[version]
-			if p.version == "" {
-				p.version = version
-				p.name = migName
-			}
-			p.downPath = path
-			partials[version] = p
+			base = strings.TrimSuffix(name, ".down.sql")
+			isDown = true
+		default:
+			continue
 		}
+
+		version, migName, err := parseMigrationBase(base)
+		if err != nil {
+			return nil, err
+		}
+
+		p := partials[version]
+		if p.version == 0 {
+			p.version = version
+			p.name = migName
+		}
+		if isUp {
+			p.hasUp = true
+		}
+		if isDown {
+			p.hasDown = true
+		}
+		partials[version] = p
 	}
 
-	versions := make([]string, 0, len(partials))
+	versions := make([]uint64, 0, len(partials))
 	for v := range partials {
 		versions = append(versions, v)
 	}
-	sort.Strings(versions)
+	sort.Slice(versions, func(i, j int) bool {
+		return versions[i] < versions[j]
+	})
 
 	out := make([]migration, 0, len(versions))
 	for _, v := range versions {
 		p := partials[v]
-		out = append(out, migration{
-			version:  p.version,
-			name:     p.name,
-			upPath:   p.upPath,
-			downPath: p.downPath,
-		})
+		if !p.hasUp {
+			return nil, fmt.Errorf("missing up migration for version %d", v)
+		}
+		if !p.hasDown {
+			return nil, fmt.Errorf("missing down migration for version %d", v)
+		}
+
+		out = append(out, migration{version: p.version, name: p.name})
 	}
+
 	return out, nil
 }
 
-func parseMigrationBase(base string) (string, string, error) {
+func parseMigrationBase(base string) (uint64, string, error) {
 	parts := strings.SplitN(base, "_", 2)
 	if len(parts) != 2 {
-		return "", "", fmt.Errorf("invalid migration file name %q: expected <version>_<name>.(up|down).sql", base)
+		return 0, "", fmt.Errorf("invalid migration file name %q: expected <version>_<name>.(up|down).sql", base)
 	}
-	version := strings.TrimSpace(parts[0])
+
+	versionRaw := strings.TrimSpace(parts[0])
 	name := strings.TrimSpace(parts[1])
-	if version == "" || name == "" {
-		return "", "", fmt.Errorf("invalid migration file name %q: empty version or name", base)
+	if versionRaw == "" || name == "" {
+		return 0, "", fmt.Errorf("invalid migration file name %q: empty version or name", base)
 	}
+
+	version, err := strconv.ParseUint(versionRaw, 10, 64)
+	if err != nil {
+		return 0, "", fmt.Errorf("invalid migration file name %q: invalid version %q", base, versionRaw)
+	}
+
 	return version, name, nil
 }
 
-func ensureMigrationTable(cfg config) error {
-	sql := fmt.Sprintf(`
-CREATE TABLE IF NOT EXISTS %s (
-	version TEXT PRIMARY KEY,
-	name TEXT NOT NULL,
-	applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-`, migrationTable)
-	return execSQL(sql, cfg)
-}
+func newMigrator(cfg config) (*migrate.Migrate, error) {
+	if strings.TrimSpace(cfg.dsn) == "" {
+		return nil, errors.New("dsn is empty")
+	}
 
-func getAppliedSet(cfg config) (map[string]bool, error) {
-	out, err := querySQL(fmt.Sprintf("SELECT version FROM %s ORDER BY version;", migrationTable), cfg)
+	absDir, err := filepath.Abs(cfg.dir)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("resolve migrations dir: %w", err)
 	}
 
-	set := make(map[string]bool)
-	for _, line := range strings.Split(out, "\n") {
-		v := strings.TrimSpace(line)
-		if v != "" {
-			set[v] = true
-		}
-	}
-	return set, nil
-}
-
-func getLastAppliedVersion(cfg config) (string, error) {
-	out, err := querySQL(fmt.Sprintf("SELECT version FROM %s ORDER BY applied_at DESC, version DESC LIMIT 1;", migrationTable), cfg)
+	sourceURL := "file://" + filepath.ToSlash(absDir)
+	m, err := migrate.New(sourceURL, cfg.dsn)
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("create migrator: %w", err)
 	}
-	return strings.TrimSpace(out), nil
+
+	return m, nil
 }
 
-func applyUpMigration(m migration, cfg config) error {
-	content, err := os.ReadFile(m.upPath)
-	if err != nil {
-		return fmt.Errorf("read %q: %w", m.upPath, err)
+func closeMigrator(m *migrate.Migrate) {
+	sourceErr, dbErr := m.Close()
+	if sourceErr != nil || dbErr != nil {
+		fmt.Fprintf(os.Stderr, "close migrator: %v\n", errors.Join(sourceErr, dbErr))
 	}
-
-	sql := fmt.Sprintf(
-		"BEGIN;\n%s\nINSERT INTO %s(version, name) VALUES ('%s', '%s');\nCOMMIT;\n",
-		string(content),
-		migrationTable,
-		escapeSQL(m.version),
-		escapeSQL(m.name),
-	)
-
-	fmt.Printf("Applying %s_%s\n", m.version, m.name)
-	if err := execSQL(sql, cfg); err != nil {
-		return fmt.Errorf("apply %s_%s: %w", m.version, m.name, err)
-	}
-	return nil
-}
-
-func applyDownMigration(m migration, cfg config) error {
-	content, err := os.ReadFile(m.downPath)
-	if err != nil {
-		return fmt.Errorf("read %q: %w", m.downPath, err)
-	}
-
-	sql := fmt.Sprintf(
-		"BEGIN;\n%s\nDELETE FROM %s WHERE version = '%s';\nCOMMIT;\n",
-		string(content),
-		migrationTable,
-		escapeSQL(m.version),
-	)
-
-	fmt.Printf("Rolling back %s_%s\n", m.version, m.name)
-	if err := execSQL(sql, cfg); err != nil {
-		return fmt.Errorf("rollback %s_%s: %w", m.version, m.name, err)
-	}
-	return nil
-}
-
-func escapeSQL(v string) string {
-	return strings.ReplaceAll(v, "'", "''")
-}
-
-func execSQL(sql string, cfg config) error {
-	cmd, err := buildPsqlCommand(cfg, false)
-	if err != nil {
-		return err
-	}
-	cmd.Stdin = strings.NewReader(sql)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	return cmd.Run()
-}
-
-func querySQL(sql string, cfg config) (string, error) {
-	cmd, err := buildPsqlCommand(cfg, true)
-	if err != nil {
-		return "", err
-	}
-	cmd.Stdin = strings.NewReader(sql)
-	cmd.Stderr = os.Stderr
-
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-
-	if err := cmd.Run(); err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(stdout.String()), nil
-}
-
-func buildPsqlCommand(cfg config, quiet bool) (*exec.Cmd, error) {
-	parts := strings.Fields(cfg.composeCmd)
-	if len(parts) == 0 {
-		return nil, errors.New("compose command is empty")
-	}
-
-	args := append(parts[1:],
-		"exec", "-T", cfg.service,
-		"psql",
-		"-v", "ON_ERROR_STOP=1",
-		"-U", cfg.user,
-		"-d", cfg.dbName,
-	)
-
-	if quiet {
-		args = append(args, "-q", "-t", "-A")
-	}
-	args = append(args, "-f", "-")
-
-	return exec.Command(parts[0], args...), nil
 }

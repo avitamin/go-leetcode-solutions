@@ -3,7 +3,7 @@ SERVICE := postgres
 DB_PORT ?= 5433
 DB_DSN ?= postgres://leetcode:leetcode@localhost:$(DB_PORT)/leetcode?sslmode=disable
 
-.PHONY: help up down restart logs ps db-shell db-reset pgsql sql-run sql-run-dir seed seed-all migrate-up migrate-down migrate-status migrate-create
+.PHONY: help up down restart logs ps db-shell db-reset pgsql sql-run sql-run-dir seed seed-all migrate-up migrate-down migrate-status migrate-create test-migrate-integration
 
 help:
 	@echo "Available commands:"
@@ -23,6 +23,7 @@ help:
 	@echo "  make migrate-down                  - rollback last migration"
 	@echo "  make migrate-status                - show migration status"
 	@echo "  make migrate-create NAME=add_users - create migration files"
+	@echo "  make test-migrate-integration      - run integration tests for cmd/migrate"
 
 up:
 	POSTGRES_PORT=$(DB_PORT) $(COMPOSE) up -d
@@ -61,14 +62,17 @@ seed-all:
 	go run ./cmd/seeder --problem second_highest_salary --dsn "$(DB_DSN)"
 
 migrate-up:
-	go run ./cmd/migrate up
+	go run ./cmd/migrate --dsn "$(DB_DSN)" up
 
 migrate-down:
-	go run ./cmd/migrate down
+	go run ./cmd/migrate --dsn "$(DB_DSN)" down
 
 migrate-status:
-	go run ./cmd/migrate status
+	go run ./cmd/migrate --dsn "$(DB_DSN)" status
 
 migrate-create:
 	@test -n "$(NAME)" || (echo "Usage: make migrate-create NAME=add_users_table" && exit 1)
 	go run ./cmd/migrate create --name "$(NAME)"
+
+test-migrate-integration:
+	MIGRATE_TEST_DSN="$(DB_DSN)" go test -tags=integration -run Integration ./cmd/migrate -v
