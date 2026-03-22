@@ -1,6 +1,7 @@
 package longest_palindromic_substring
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -29,10 +30,8 @@ func TestLongestPalindrome_CanonicalExamples(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ResetLogs()
 			got := longestPalindrome(tt.input)
 			if _, ok := tt.allowed[got]; !ok {
-				Flushlogs()
 				t.Fatalf("longestPalindrome(%q) = %q, allowed: %v", tt.input, got, keys(tt.allowed))
 			}
 		})
@@ -94,10 +93,8 @@ func TestLongestPalindrome_ConstraintBoundaries(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ResetLogs()
 			got := longestPalindrome(tt.input)
 			if got != tt.expected {
-				Flushlogs()
 				t.Fatalf("longestPalindrome(%q) = %q, want %q", tt.input, got, tt.expected)
 			}
 		})
@@ -138,10 +135,8 @@ func TestLongestPalindrome_SpecialCaseBehavior(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ResetLogs()
 			got := longestPalindrome(tt.input)
 			if _, ok := tt.allowed[got]; !ok {
-				Flushlogs()
 				t.Fatalf("longestPalindrome(%q) = %q, allowed: %v", tt.input, got, keys(tt.allowed))
 			}
 		})
@@ -154,4 +149,51 @@ func keys(m map[string]struct{}) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+var benchmarkLongestPalindromeResult string
+
+func BenchmarkLongestPalindrome(b *testing.B) {
+	benchmarks := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "canonical_babad",
+			input: "babad",
+		},
+		{
+			name:  "canonical_cbbd",
+			input: "cbbd",
+		},
+		{
+			name:  "mixed_medium",
+			input: "forgeeksskeegfor",
+		},
+		{
+			name:  "repeated_128",
+			input: strings.Repeat("a", 128),
+		},
+		{
+			name:  "repeated_1024",
+			input: strings.Repeat("a", 1024),
+		},
+		{
+			name:  "no_long_runs_1040",
+			input: strings.Repeat("abcdefghijklmnopqrstuvwxyz", 40),
+		},
+	}
+
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ReportAllocs()
+
+			var result string
+			for i := 0; i < b.N; i++ {
+				result = longestPalindrome(bm.input)
+			}
+
+			benchmarkLongestPalindromeResult = result
+		})
+	}
 }
